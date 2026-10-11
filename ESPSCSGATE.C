@@ -3,7 +3,7 @@
 // definire _ESP8285  oppure _ESP8266  oppure _RASPBERRY_7 o RASPBERRY_8
 //   RASPBERRY8  vale anche per la versione ARDUINO
 
-#define VERSION1 "543" // very slow speed for arduino - very high speed mode (@^) - high speed mode (@')
+#define VERSION1 "544" // tabella dispositivi allineata al firmware MyHOMEServer1 (vedi 19.544 e README.md)
 
 // ----------------------------------------------------
 
@@ -34,6 +34,10 @@
 
 #define VERSION  VERSION0 VERSION1 VERSION2
 
+// 19.544 tabella dispositivi: regole di riconoscimento prese dal firmware MyHOMEServer1 e verificate
+//        su 26.809 frame (tools/devtab_test): gruppi B5/aree B3 non sono dispositivi, x0/x1 = ON/OFF,
+//        0D = ON (non livello dimmer), x3/x4/AB/BB = dimmer, zone termo da tutti i frame 30..3F (0..255),
+//        frame estesi D1 (dimmer, tapparelle, termo, energia 0x10). MsgValido: "check != 0" invece di "check ^= 0".
 // 19.539 auto-ack
 // 19.538 filtro 8 per accettare checksum errati
 // 19.537 uart high speed
@@ -238,6 +242,16 @@ typedef union _DEVICE   { // 0xFF:empty
 // ===================================================================================
 #pragma udata TABDEV
 DEVICE devc[DEV_NR]; // 0xFF:empty  01:switch  03:dimmer  08:tapparella  09:tapp%  0E:allarme   0F:termostato
+// 19.544 - codici tipo dispositivo (tabella devc). I valori 01..0F sono quelli storici letti dall'ESP;
+//          10..1F sono nuovi (riconosciuti dai frame estesi e dai frame della termoregolazione).
+#define DEVT_SWITCH		0x01	// interruttore (ON/OFF)
+#define DEVT_DIMMER		0x03	// dimmer
+#define DEVT_COVER		0x08	// tapparella
+#define DEVT_COVER_PCT	0x09	// tapparella con posizione in percentuale (tabella devicetappa)
+#define DEVT_GENERIC	0x0B	// generico
+#define DEVT_ALARM		0x0E	// allarme
+#define DEVT_THERMO		0x0F	// zona di termoregolazione (sonda / termostato)
+#define DEVT_ENERGY		0x10	// misuratore di energia (WHO 18, indirizzo A0|N = WHERE 5N)
 BYTE didx;
 BYTE dlen;
 // ===================================================================================
@@ -3509,7 +3523,7 @@ BYTE check = 0;
 			check ^= scsMessageRx[rBufferIdxR][f];
 			f++;
 		}
-		if	(check ^= 0)
+		if	(check != 0)		// 19.544 - era "check ^= 0" (equivalente, ma illeggibile)
 		{
 			errorChecksum++;
 			if (!(opt.opzioneFiltro & 0x08))
@@ -3607,6 +3621,11 @@ BYTE tmpfrom = 0;
 BYTE tmptype = 0;
 BYTE tmpcmd  = 0;
 BYTE tmpbus  = 0xFF;
+BYTE tmpext  = 0;	// 19.544 - primo byte di un frame esteso D0..D5
+BYTE tmpsys  = 0;	// 19.544 - byte "sistema" del frame esteso
+BYTE tmpdim  = 0;	// 19.544 - byte dimensione del frame esteso
+BYTE tmpb1   = 0;	// 19.544 - primo byte dati del frame esteso
+BYTE tmpraw  = 0;	// 19.544 - byte tipo originale (prima della normalizzazione 3N -> 30)
 
 #ifdef	UART1_CALL
 	inUART();
@@ -3639,7 +3658,7 @@ BYTE tmpbus  = 0xFF;
 					  (scsMessageRx[rBufferIdxR][1] == 0xA8) &&
 					  (scsMessageRx[rBufferIdxR][2] == 0xEC) &&
 					  (scsMessageRx[rBufferIdxR][11] == 0xA3))
-// 0B A8 EC bb 00 00 dd ss 12 cc C6 A3
+// 0B A8 EC bb 00 00 dd ss 12 cc C6 A3   (frame instradato attraverso l'interfaccia bb)
 				  {
 					  if (scsMessageRx[rBufferIdxR][3] == 0xFF)
 						  tmpbus = scsMessageRx[rBufferIdxR][4];
@@ -3650,8 +3669,38 @@ BYTE tmpbus  = 0xFF;
 					  tmptype = scsMessageRx[rBufferIdxR][8];
 					  tmpcmd  = scsMessageRx[rBufferIdxR][9];
 				  }
+				  else
+				  if ((scsMessageRx[rBufferIdxR][0] == 11) &&
+					  (scsMessageRx[rBufferIdxR][1] == 0xA8) &&
+					  (scsMessageRx[rBufferIdxR][2] >= 0xD0) &&
+					  (scsMessageRx[rBufferIdxR][2] <= 0xD5) &&
+					  (scsMessageRx[rBufferIdxR][11] == 0xA3))
+// 0B A8 D1 aa ss kk DD b1 b2 b3 cc A3   (frame esteso "dimensioni": D1 punto, D2 generale/risposta, D5 area/gruppo)
+//    ss = sistema (nibble basso: 1 luci/tapparelle, 2 energia, 3 termo; nibble alto = interfaccia bus)
+//    kk = 42 scrittura, 43 richiesta, 44 risposta (luci); 02 scrittura, 03 richiesta, 34 risposta (termo); 32/33/34 (energia)
+// 19.544 - riconoscimento dispositivi anche dai frame estesi (regole ricavate dal firmware MyHOMEServer1)
+				  {
+					  tmpext  = scsMessageRx[rBufferIdxR][2];
+					  tmpdest = scsMessageRx[rBufferIdxR][3];
+					  tmpsys  = scsMessageRx[rBufferIdxR][4];
+					  tmpcmd  = scsMessageRx[rBufferIdxR][5];
+					  tmpdim  = scsMessageRx[rBufferIdxR][6];
+					  tmpb1   = scsMessageRx[rBufferIdxR][7];
+				  }
 
 				  // -----------------------------aggiorna tabella dispositivi-------------------------------
+				  // 19.544 - le regole seguenti sono quelle dei traduttori del firmware MyHOMEServer1
+				  //          (bt_luci, coso, bt_termo, bt_supervisione) verificate su 26.809 frame:
+				  //          - valore x0 = ON, x1 = OFF (il nibble alto e' ignorato dal firmware)
+				  //          - valore x3 / x4 / AB / BB = dimmer su/giu'  (WHAT 30/31)
+				  //          - valore 1D..9D = livello dimmer 20..100%   (WHAT 2..10); 0D = semplice ON
+				  //          - valore 08 / 09 / 0A = tapparella su / giu' / stop
+				  //          - B5 0N = comando di gruppo N, B3 0A = comando di area A: NON sono indirizzi di dispositivo
+				  //          - tipo 3N (N = indice sonda/attuatore) = termoregolazione, zona nel secondo byte (0..255)
+
+				  tmpraw = tmptype;
+				  if ((tmptype & 0xF0) == 0x30)	// 19.544 - termostati: 30..3F
+					  tmptype = 0x30;
 
 				  switch (tmptype)   
 				  {
@@ -3661,7 +3710,8 @@ BYTE tmpbus  = 0xFF;
 				  case 0x12:	// comando/stato automazione
 					  // implementazione di test per auto-ack
 
-					if (tmpdest < 0xB0)
+					didx = 0;
+					if (tmpdest < 0xB0)			// comando punto-punto: dest = indirizzo (A PL)
 					{
 						didx = tmpdest;
 						if ((tmpdest <= auto_ack_high) && (tmpdest >= auto_ack_low))	// TEST AUTO-ACK  (0xA5)
@@ -3671,33 +3721,24 @@ BYTE tmpbus  = 0xFF;
 						}
 					}
 					else
+					if (tmpdest == 0xB8)		// stato trasmesso dal dispositivo: source = indirizzo
 					{
 						didx = tmpfrom;
-
-						if (tmpdest == 0xB3)  // gruppo/scenario
-							didx = 0;
-						else
-						if (tmpdest == 0xB1)  // tutti
-						{
-							didx = 0xB1;
-							if (opt.tapparelle_pct)
-								CmdTotaleTapparelle(tmpcmd);
-						}
 					}
+					else
+					if (tmpdest == 0xB1)		// comando generale (tutti)
+					{
+						didx = 0xB1;
+						if (opt.tapparelle_pct)
+							CmdTotaleTapparelle(tmpcmd);
+					}
+					// 19.544 - B3 0A (area) e B5 0N (gruppo): il secondo byte e' l'area/gruppo, non un dispositivo.
+					//          Prima la 0xB5 veniva registrata come dispositivo "N" (es. B5 03 12 00 creava lo switch 03).
 
 					if ((didx > 0) && (didx < DEV_NR)) 
 					{
 						switch (tmpcmd)
 						{
-						case 0:
-						case 0x01:
-							if (devc[didx].all == 0xFF)
-								devc[didx].devType = 1;
-							break;
-						case 0x03:
-						case 0x04:
-							devc[didx].devType = 3;
-							break;
 // -----------------------------aggiorna anche tabella tapparelle-----------------------------
 						case 0x08:					// alza
 							if (devc[didx].devType != 9) devc[didx].devType = 8;
@@ -3780,22 +3821,46 @@ BYTE tmpbus  = 0xFF;
 							break;
 // -------------------------------------------------------------------------------------------
 						default:
-							if ((tmpcmd & 0x0F) == 0x0D)
-								devc[didx].devType = 3;
+							f = tmpcmd & 0x0F;
+							if ((f == 0x03) || (f == 0x04)			// x3 = piu'  x4 = meno  (dimmer, WHAT 30/31)
+							||  (tmpcmd == 0xAB) || (tmpcmd == 0xBB))	// AB = 30   BB = 31
+							{
+								devc[didx].devType = DEVT_DIMMER;
+							}
+							else
+							if ((f == 0x0D) && (tmpcmd >= 0x1D) && (tmpcmd <= 0x9D))	// 1D..9D = livello 20..100% (WHAT 2..10)
+							{
+								devc[didx].devType = DEVT_DIMMER;
+							}
+							else
+							if ((tmpdest == 0xB8) &&				// come STATO 02..07, 0C, 0F = sconosciuto (WHAT 255);
+							   (((tmpcmd >= 0x02) && (tmpcmd <= 0x07))	// come COMANDO 06 = ON
+							||  (tmpcmd == 0x0C) || (tmpcmd == 0x0F)))
+							{
+							}
+							else									// x0 ON, x1 OFF, 0D ON, x6 temporizzazioni, xB lampeggi,
+							{										// 0E/EE (19), AD..FD (1000#11..16): e' una luce
+								if (devc[didx].all == 0xFF)
+									devc[didx].devType = DEVT_SWITCH;
+							}
 							break;
 
 						} // switch  scsMessageRx[rBufferIdxR][5]
 					} // 	if ((didx > 0) && (didx < DEV_NR))
 					break;				
 
-				  case 0x30:	// termostati
-					if (tmpdest == 0xB4)
+				  case 0x30:	// termostati  (tipo 30..3F: il nibble basso e' l'indice di sonda / attuatore)
+					// 19.544 - frame brevi della termoregolazione: B4/B5 temperatura misurata, 90/91/92 set point,
+					//          93 modo, 96/B7 stato attuatore, 99/A6/A9 richieste, 9D/9E/9F eventi.
+					//          La zona e' SEMPRE nel secondo byte (0..255; prima era accettata solo < 0x0F e solo con B4).
+					//          Nei frame 9D/9E/B7 e con tipo 31..3F il bit 7 della zona indica la forma "zona#attuatore".
+					didx = tmpfrom;
+					if ((tmpdest == 0x9D) || (tmpdest == 0x9E) || (tmpdest == 0xB7)
+					||  (tmpraw != 0x30))
+						didx &= 0x7F;
+					if ((didx > 0) && (didx < DEV_NR)) 
 					{
-						didx = tmpfrom;     // log 0xC1
-						if ((didx > 0) && (didx < 0x0F)) 
-						{
-							devc[didx].devType = 0x0F;
-						}
+						devc[didx].devType = DEVT_THERMO;
 					}
 				    break;
 
@@ -3811,7 +3876,7 @@ BYTE tmpbus  = 0xFF;
 					}
 					if ((didx > 0) && (didx < DEV_NR)) 
 					{
-						devc[didx].devType = 0x0E;
+						devc[didx].devType = DEVT_ALARM;
 					}
 					break;
 
@@ -3819,6 +3884,41 @@ BYTE tmpbus  = 0xFF;
 					break;
 
 				  } //  switch (scsMessageRx[rBufferIdxR][4]
+
+				  // 19.544 - frame estesi "dimensioni" (D1 aa ss kk DD ...): solo i D1 (punto) individuano un dispositivo;
+				  //          D2 e' generale / risposta senza indirizzo utile per la tabella, D5 e' area o gruppo.
+				  if (tmpext == 0xD1)
+				  {
+					  didx = tmpdest;
+					  switch (tmpsys & 0x0F)
+					  {
+					  case 0x01:	// luci / tapparelle  (D1 aa 01 42|43|44 DD b1 b2 b3)
+						  if ((didx > 0) && (didx < DEV_NR))
+						  {
+							  if ((tmpdim == 0x0D) && (tmpb1 == 0x0D))		// dimensione 1 (livello + velocita'): e' un dimmer
+							  {
+								  devc[didx].devType = DEVT_DIMMER;
+							  }
+							  else
+							  if (tmpdim == 0x09)							// dimensioni 10/11/12 di coso: e' una tapparella
+							  {
+								  if (devc[didx].devType != 9) devc[didx].devType = DEVT_COVER;
+							  }
+						  }
+						  break;
+					  case 0x02:	// energia  (D1 aa 02 32|33 ...  aa = A0|N  <->  WHERE 5N)
+						  if ((didx > 0) && (didx < DEV_NR))
+							  devc[didx].devType = DEVT_ENERGY;
+						  break;
+					  case 0x03:	// termoregolazione  (D1 zz 03 02|03 ...;  D1 (80|zz) 13 02 ... = attuatore)
+						  if (tmpsys != 0x03) didx &= 0x7F;
+						  if ((didx > 0) && (didx < DEV_NR))
+							  devc[didx].devType = DEVT_THERMO;
+						  break;
+					  default:
+						  break;
+					  }
+				  }
 				} //  if sm_stato   !=  SM_TEST_MODE) &&
 // -------------------------------------------------------------------------------------------
 			} // if  (rBufferIdxR != rBufferIdxInternal) : se non ancora trattato internamente
