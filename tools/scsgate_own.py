@@ -84,21 +84,36 @@ def run_lines(lines, out):
 
 
 def run_raw(stream, out):
-    """Hex mode: <len><bytes...>; 0x00 = empty answer; 'k'/'E' answers and 0xF0 banner are passed through."""
+    """Hex mode: <len><bytes...>; 0x00 = empty answer; 'k'/'E' answers and the banner are passed through.
+
+    The stream is resynchronised on <len> A8 ... A3 (len 7 or 11), so a stray answer byte or a
+    partial read does not shift every following frame.
+    """
+    buf = b''
     while True:
-        b = stream.read(1)
-        if not b:
+        chunk = stream.read(1)
+        if not chunk:
             return
-        n = b[0]
-        if n == 0 or n > 15:
-            continue
-        frame = stream.read(n)
-        if len(frame) < n:
-            return
-        hx = ' '.join('%02X' % x for x in frame)
-        msgs = translate(hx)
-        out.write('%-40s -> %s\n' % (hx, ' + '.join(msgs) if msgs else '(no OpenWebNet mapping)'))
-        out.flush()
+        buf += chunk
+        while buf:
+            n = buf[0]
+            if n in (7, 11) and len(buf) >= 2 and buf[1] != 0xA8:
+                buf = buf[1:]
+                continue
+            if n not in (7, 11):
+                buf = buf[1:]
+                continue
+            if len(buf) < 1 + n:
+                break                       # wait for the rest of the frame
+            frame = buf[1:1 + n]
+            if frame[-1] != 0xA3:
+                buf = buf[1:]               # not a frame: skip the length byte and resync
+                continue
+            buf = buf[1 + n:]
+            hx = ' '.join('%02X' % x for x in frame)
+            msgs = translate(hx)
+            out.write('%-40s -> %s\n' % (hx, ' + '.join(msgs) if msgs else '(no OpenWebNet mapping)'))
+            out.flush()
 
 
 def main():

@@ -6,9 +6,10 @@ image, run under ARM emulation on a fake SCS bus):
 
 | Folder | What | Validation |
 |---|---|---|
-| `scs_own.c`, `scs_own.h`, `scs_own_tables.h` | C99 port, frame → OpenWebNet only, no allocation, no dependencies | identical to the Python on the 26,809-row corpus, 150,000 random frames and 188,193 mutated frames |
-| `py/` | Python translator, both directions (`scs_own_all.py` + rule modules + `fw_tables.json`) | reproduces 111,820 / 111,820 recorded firmware answers |
+| `scs_own.c`, `scs_own.h`, `scs_own_tables.h` | C99 port, frame → OpenWebNet only, no allocation, no dependencies | identical to the Python on the 26,809-row corpus (`make test`); during development also on 150,000 random and 188,193 mutated frames |
+| `py/` | Python translator, both directions (`scs_own_all.py` + rule modules + `fw_tables.json`) | reproduces 111,820 / 111,820 recorded firmware answers (`python3 py/validate_all.py`) |
 | `hex2own_corpus.tsv` | every frame the firmware decodes, with its OpenWebNet output | the test oracle for both ports |
+| `corpus/` | the 31 recorded firmware sweeps (hex → OWN and OWN → hex, per program) that `validate_all.py` replays | 111,820 answers |
 
 The byte-level rules are written up in `py/SCS_OWN_ALL_MAP.md` (all WHO) and `py/SCS_OWN_MAP.md`
 (heating in detail). Nothing in them comes from manuals: every row is observed firmware output.
@@ -40,6 +41,7 @@ it does not fit the PIC18F26K80 (the tables alone are larger than its flash).
 ```sh
 python3 py/scs_own_all.py hex 'A8 B8 31 12 00 9B A3'      # -> *1*1*31##
 python3 py/scs_own_all.py own '*#4*40*14##'               # -> A8 99 28 30 0E 8F A3
+python3 py/validate_all.py                                # replays corpus/: TOTAL 111820/111820
 ```
 
 `../scsgate_own.py` wraps it for the gateway's serial output.

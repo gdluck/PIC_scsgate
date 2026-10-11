@@ -2,3 +2,4 @@ tools/scs_own/scs_own_test
 tools/devtab_test/devtab_test
 tools/devtab_test/classifier.inc
 __pycache__/
+tools/devtab_test/covers.inc

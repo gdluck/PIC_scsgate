@@ -11,8 +11,10 @@ no commercial use and no redistribution without the author's consent.
 
 This fork adds what was learned by running the original BTicino **MyHOMEServer1** gateway programs
 (`bt_luci`, `coso`, `bt_termo`, `bt_supervisione`, …) on an emulated bus: the exact meaning of the SCS
-bytes, and a validated SCS ⇄ OpenWebNet translator (`tools/`). The PIC code itself was corrected where
-its interpretation of the bus disagreed with the firmware (see *Device table* below).
+bytes, and a validated SCS ⇄ OpenWebNet translator (`tools/`). The F454, F459, F461 and F450 firmwares
+put the same bytes on the bus. The PIC code itself was corrected where its interpretation of the bus
+disagreed with the firmware (see *Device table* below), and its bus write retry was fixed (see *Bus
+writes and thermostats*).
 
 ## Layout
 
@@ -24,7 +26,7 @@ its interpretation of the bus disagreed with the firmware (see *Device table* be
 | `LIB/CANREPRO_232_EVO*.ASM`, `canrepro.inc` | in-circuit firmware update over the UART |
 | `espscsgate_RASPY_8.mcp`, `LIB/18F26K80_B.LKR` | MPLAB 8 project and linker script (Microchip C18 compiler) |
 | `BIN/espscsgate_RASPY_8.hex` | a prebuilt image (upstream, version 543) |
-| `tools/scs_own/` | SCS ⇄ OpenWebNet translator recovered from the MyHOMEServer1 firmware (C99 + Python), with its 26,809-frame test corpus |
+| `tools/scs_own/` | SCS ⇄ OpenWebNet translator recovered from the MyHOMEServer1 firmware (C99 + Python), with the 26,809-frame corpus and the 111,820 recorded firmware answers it is validated against |
 | `tools/scsgate_own.py` | reads the gateway's serial output and prints the OpenWebNet messages for each frame |
 | `tools/devtab_test/` | host build of the PIC's device-table classifier, replayed against the firmware corpus |
 
@@ -49,8 +51,8 @@ Short frame `dd ss tt vv`:
 
 Type byte `tt`: `12` command / status for lights and covers, `15` status request (`dd 00 15 00`),
 `10` / `11` unlock / lock an actuator (WHO 14), `17` and `1C` scenario modules (WHO 0), `9A`…`9C`
-auxiliaries (WHO 9), `30`…`3F` heating (the low nibble is the probe / actuator index, the zone is in
-`ss`), `81`/`83`/`8F` sound, `90`…`97` CEN+. Value byte `vv` for type `12`:
+auxiliaries (WHO 9), `30`…`3F` heating (see below), `81`/`83`/`8F` sound, `90`…`97` CEN+. Value byte
+`vv` for type `12`:
 
 | `vv` | OpenWebNet | `vv` | OpenWebNet |
 |---|---|---|---|
@@ -58,17 +60,32 @@ auxiliaries (WHO 9), `30`…`3F` heating (the low nibble is the probe / actuator
 | `x3` / `x4` (also `AB` / `BB`) | dimmer up / down (WHAT 30 / 31) | `1D`…`9D` | dimmer level 20…100 % (WHAT 2…10) |
 | `0D` | ON | `0E`, `EE` | WHAT 19 |
 | `16`…`86` | timers (WHAT 11…18) | `0B`, `1B`…`9B` | blinking (WHAT 20…29) |
-| `08` / `09` / `0A` | cover up / down / stop (WHO 2) | `02`…`07`, `0C`, `0F` | unknown status (WHAT 255) |
+| `08` / `09` / `0A` | cover up / down / stop (WHO 2) | `02`…`07`, `0C`, `0F` **as a status** (`B8`) | unknown status (WHAT 255) |
 
-The high nibble `x` is ignored by the firmware where shown. Extended frames `D1 aa ss kk DD b1 b2 b3`
-carry dimensions (`ss` = system: `x1` lights/covers, `x2` energy, `x3` heating, high nibble = interface;
-`kk` = `42` write, `43` request, `44` answer for lights; `02` / `03` / `34` for heating; `32` / `33` / `34`
-for energy). `D2` is the general / answer form, `D5` area or group. Full tables, including every heating
-dimension and the energy meter frames: `tools/scs_own/py/SCS_OWN_ALL_MAP.md`.
+The high nibble `x` is ignored by the firmware where shown. Note the asymmetry: `03` / `04` are dimmer
+up / down when sent as a command, but reported by a device (`B8 dd 12 03`) they are "unknown status",
+while `13`, `23` … `F3` and `AB` keep the dimmer meaning in both directions. `06` is ON as a command.
+
+Heating frames `dd zz 3N vv` (WHO 4): `zz` is the zone, `N` the probe / actuator index. `B4` / `B5` are
+the measured temperature reported by the zone probe, `90` / `91` / `92` the set point written to the zone,
+`93` and `9F` / `BF` mode commands, `96` actuator command and `B7` actuator status, `9D` / `9E` events;
+`99`, `A6`, `A9` are the requests the central unit sends (also to zones that do not exist). When bit 7
+of `zz` is set and `N` is not 0, the frames `96` `99` `9D` `9E` `B7` address actuator `N` of zone
+`zz & 0x7F` (`B7 80 31 01` = `*#4*0#1*20*0##`); in `B4` `B5` `90`…`93` the byte is used whole
+(`B4 80 31 E6` = zone 128, which does not exist in OpenWebNet). With bit 7 clear, `N` is a probe index
+(`B4 28 31 00` = probe 1 of zone 40, `*#4*140*…`), except in `90`…`93` where it is ignored.
+
+Extended frames `D1 aa ss kk DD b1 b2 b3` carry dimensions: `aa` is the address (`D1` command / request to
+a point, `D2` answer from a point; `D2 00` general, `D5` area or group), `ss` the system (`x1` lights and
+covers, `x2` energy, `x3` heating; the high nibble is the bus interface for lights and the probe / actuator
+index for heating), `kk` the kind (low nibble `2` write, `3` request, `4` answer: `42` / `43` / `44` lights,
+`02` / `03` / `34` heating, `32` / `33` / `34` energy). Energy meters are `aa = A0|N` (WHERE `5N`);
+heating dimension bytes `C1` / `C2` are central-unit forms (`#0#N`, `#N`), where `aa` is not a zone. Full
+tables, including every heating dimension and the energy meter frames: `tools/scs_own/py/SCS_OWN_ALL_MAP.md`.
 
 ## Serial protocol (summary)
 
-The UART runs at 115200 8N1 (`@^` 2 Mbaud, `@'` 500 kbaud, `@`+`0xED` 38400, `@`+`0xEE` 19200).
+The UART runs at 115200 8N1 (`@^` 2 Mbaud, `@9` 500 kbaud, `@`+`0xED` 38400, `@`+`0xEE` 19200).
 Commands start with `@`; in **ascii mode** parameters are hex digits, in **hex mode** they are raw bytes.
 Most commands answer `k` (ok) or `E` (error).
 
@@ -81,7 +98,7 @@ Most commands answer `k` (ok) or `E` (error).
 | `@F0`…`@F8` | filter bits: 1 drop repeated frames, 2 drop `A5` acks, 4 drop status frames, 8 accept wrong checksums |
 | `@A`/`@B` `[i|e][n][vv]` | byte filters: include / exclude frames whose byte `n` equals `vv` |
 | `@Y0`…`@Y3` | short form: 1 omit `A8`, checksum and `A3` when reporting, 2 when writing, 3 both |
-| `@W<len><bytes>` | write a complete frame (`K` in place of the checksum computes it) |
+| `@W<len><bytes>` | write a complete frame; `len` is **one hex digit** (`7` for a short frame, `B` for an 11-byte extended frame: `@WBA8D1…A3`, never `@W11…`); `K` in place of the checksum computes it |
 | `@y<4 bytes>` | write a short frame body; `A8`, checksum and `A3` are added |
 | `@X<8 bytes>` | write an extended body (routed `EC …` frames; sent as a short frame when the bus id is the local one) |
 | `@w<vv><dd>` | point command: `A8 dd 00 12 vv chk A3` |
@@ -102,27 +119,61 @@ The gateway learns device types from the traffic it hears and reports them with 
 | Type | Meaning | Learned from |
 |---|---|---|
 | `01` | switch | any WHO 1 frame to or from the address (ON / OFF, timers, blinking, …), if the address is still unknown |
-| `03` | dimmer | dimmer up / down, a level `1D`…`9D`, or a dimension 1 (level + speed) frame |
-| `08` | cover | up / down / stop, or a cover position frame (dimension `09`) |
+| `03` | dimmer | dimmer up / down or a level `1D`…`9D` (command, or `13`…`F3` / `AB` / `BB` as status), or a dimension 1 (level + speed) write / answer |
+| `08` | cover | up / down / stop, or a cover position write / answer (dimension `09`) |
 | `09` | cover with position tracking | set by `@U` |
 | `0E` | alarm | type bytes `43`, `44`, `49`, `4E` (upstream rule, not from the firmware) |
-| `0F` | heating zone | any short frame of type `30`…`3F` (zone in the second byte), or an extended heating frame |
-| `10` | energy meter | extended frames with system `02` (address `A0\|N` = WHERE `5N`) |
+| `0F` | heating zone (1…99) | `B4` `B5` `96` `B7` `9D` `9E` `9F` `BF` `90`…`93` short frames (zone in the second byte), or an extended heating write / answer; not from the requests `99` `A6` `A9` |
+| `10` | energy meter | extended energy write / answer with address `A1`…`AF` (WHERE `51`…`515`) |
 
 Rules that changed in this fork, each contradicted by the firmware corpus before the change:
 
-* `B5 0N 12 vv` (group command) was recorded as device `0N`; `B3` (area) likewise; groups and areas are
-  not devices.
+* `B5 0N 12 vv` (group command) was recorded as device `0N`; `B3` (area) likewise. Groups and areas are
+  not devices. Area cover commands (`B3 0A 12 08/09/0A`) now move the tracked covers of area `A`
+  (`CmdGruppoTapparelle`); group membership is not visible on the bus, so `B5` cannot be applied.
 * `x0` / `x1` with a non-zero high nibble were ignored; the firmware reads them as ON / OFF.
 * `0D` was taken as a dimmer level; it is a plain ON. Dimmer levels are `1D`…`9D` only.
-* `03` / `04` (dim up / down) were matched exactly; the firmware ignores the high nibble, and `AB` / `BB` mean the same.
-* Heating zones were detected only in `B4 ZZ 30 vv` frames and only for zones below 15. All short
-  heating frames carry the zone, and zone numbers go to 255 (99 in OpenWebNet terms, `0x80|Z` for actuators).
-* Extended frames (`D1 …`) were ignored for the table; they now identify dimmers, covers, heating zones
-  and energy meters.
+* `03` / `04` were matched exactly as dimmer up / down. As commands the firmware ignores the high nibble
+  (`13`, `23`, `AB` …); as a status (`B8 dd 12 03`) they are "unknown", and no type is recorded.
+* Heating zones were detected only in `B4 zz 30 vv` frames and only for zones below 15. Zones 1…99 are now
+  read from every frame a zone emits or is written with (see the frame notes above); requests are ignored,
+  as the status request `15` is for lights, because the central unit also polls zones that do not exist.
+* Extended frames were ignored for the table; `D1` / `D2` writes and answers now identify dimmers, covers,
+  heating zones and energy meters. Requests (`kk = x3`) do not, for the same reason.
+
+Zones and light addresses share the same byte values (zone 40 is `0x28`, which is also A2 PL8). The table
+has one entry per byte, so the first type seen wins between switch, heating zone and energy meter;
+dimmer and cover evidence (level / position frames) still overrides, as upstream. `@DFF` clears the table.
 
 `tools/devtab_test` compiles the classifier straight out of `ESPSCSGATE.C` and replays the corpus
-through it: 7,259 frames carry a verifiable expectation, and all 7,259 match (upstream: 742).
+through it. The expected type of each frame is derived from the OpenWebNet text the firmware emitted for
+it (WHO, WHAT and WHERE), not from the classifier's rules: 19,549 of the 26,809 frames carry such an
+expectation and all 19,549 match (the upstream classifier: 2,616). The same harness checks the area
+cover command against tracked covers.
+
+## Bus writes and thermostats
+
+`queueWrite` retried a frame up to 50 times after a collision with all interrupts still disabled, so the
+"wait for a free bus" loop before each retry could not see the frame it had collided with (the receive
+flag it polls is set by an interrupt) and fired again after 4 ms, in the middle of the other device's
+frame, a few stray pulses at a time. KW4691 / 4691 thermostats, which talk to their actuator and central
+unit in long extended-frame dialogues, are the devices most exposed to this: a corrupted exchange with
+their actuator puts them in error. The retry loop now re-enables interrupts after every attempt, also
+looks at the bus level itself (`INPUT_SCS`), waits longer after each collision (8, 12, 16 … ms of
+silence) and gives up after 10 attempts instead of 50. The change is in C only (`queueWrite`); the
+bit-level driver in `LIB/SCS_UART.ASM` is untouched. It has not been run on a bench: it is a logic
+fix, and the description above is what the code did before.
+
+## Notes for host software
+
+* `@W` takes a single hex digit as length: `@W7A8…A3` for short frames, `@WBA8…A3` for extended ones.
+  `@W11A8…` is read as length 1 and writes the single byte `1A` on the bus.
+* Zone status request: `*#4*Z##` → `A8 99 Z 30 00 chk A3` (the firmware also sends `99 Z 30 12`, `0E`, `0D`).
+* Set point: `*#4*Z*#14*TTTT*M##` → `A8 90|91|92 Z 30 T chk A3` (`90` heating, `91` cooling, `92`
+  generic; `T` = temperature in half degrees, `0230` → `2E`). Mode: `*4*303*Z##` (off) →
+  `93 Z 30 0F`, `*4*102*Z##` (antifreeze) → `93 Z 30 02`, `*4*202*Z##` (thermal protection) → `93 Z 30 03`.
+  `D2 Z 03 34 12 …` and `B7 Z 30 …` are answers / status reports from the zone, not commands.
+  `python3 tools/scsgate_own.py --own '<message>'` prints the frame and the `@W` command for it.
 
 ## Tools
 
@@ -135,12 +186,13 @@ python3 tools/scsgate_own.py capture.txt
 python3 tools/scsgate_own.py --own '*1*1*31##'            # -> A8 31 00 12 00 23 A3, send with @W7A83100120023A3
 
 # tests
-make -C tools/scs_own test        # C translator vs corpus: 26809/26809
-make -C tools/devtab_test test    # PIC classifier vs corpus: 7259/7259
+make -C tools/scs_own test                  # C translator vs corpus: 26809/26809
+python3 tools/scs_own/py/validate_all.py    # Python translator vs every recorded firmware answer: 111820/111820
+make -C tools/devtab_test test              # PIC classifier vs corpus: 19549/19549 + cover area test
 ```
 
 ## Building the PIC image
 
 MPLAB 8 with the Microchip C18 compiler, project `espscsgate_RASPY_8.mcp`. Define one of `_ESP8266`,
 `_ESP8285`, `_RASPBERRY_8` (and `_BOOTMODE` for the bootloader layout) in the project settings. The
-changes in this fork are plain C89 in `ESPSCSGATE.C` only; the bus driver and the build are untouched.
+changes in this fork are plain C89 in `ESPSCSGATE.C` only (version 544); the bus driver and the build are untouched.

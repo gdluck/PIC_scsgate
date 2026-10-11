@@ -512,7 +512,7 @@ def _light_dim(hdr, d, a, na):
         return fill([t, 0x16], ints)
     if dn == '12' and na == 3 and ints[0] <= 359 and ints[1] <= 100 and ints[2] <= 100:
         return fill([t, 0x0C], [ints[0] & 0xFF, ints[1] | ((ints[0] >> 8) << 7), ints[2]])
-    if dn == '14' and na == 1 and 1 <= ints[0] <= 1000:
+    if dn == '14' and na == 1 and 1 <= ints[0] <= 65534:      # bt_luci: 1..10000 accepted, 0 and 65535 refused (au3 run)
         return fill([t, 0x0B], [ints[0] >> 8, ints[0] & 0xFF])
     if dn == '15' and na == 1 and ints[0] in (0, 1) and hdr[0] == 0xD5 and hdr[2] == 0x01:
         return fill([t, 0x07, 0x00, 0x00], [1 - ints[0]])

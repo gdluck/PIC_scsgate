@@ -34,10 +34,16 @@
 
 #define VERSION  VERSION0 VERSION1 VERSION2
 
-// 19.544 tabella dispositivi: regole di riconoscimento prese dal firmware MyHOMEServer1 e verificate
-//        su 26.809 frame (tools/devtab_test): gruppi B5/aree B3 non sono dispositivi, x0/x1 = ON/OFF,
-//        0D = ON (non livello dimmer), x3/x4/AB/BB = dimmer, zone termo da tutti i frame 30..3F (0..255),
-//        frame estesi D1 (dimmer, tapparelle, termo, energia 0x10). MsgValido: "check != 0" invece di "check ^= 0".
+// 19.544 tabella dispositivi: regole di riconoscimento prese dal firmware MyHOMEServer1 (identiche in F454,
+//        F459, F461, F450) e verificate su 26.809 frame registrati (tools/devtab_test): gruppi B5 / aree B3 non
+//        sono dispositivi; x0/x1 = ON/OFF; 0D = ON (non livello dimmer); x3/x4/AB/BB = dimmer come comando, mentre
+//        come stato (B8) 02..07/0C/0F = stato sconosciuto; zone termo 1..99 dai frame B4 B5 96 B7 9D 9E 9F BF 90..93
+//        (non dalle richieste 99 A6 A9), forma zona#attuatore (bit 7) solo in 96 9D 9E B7; frame estesi D1/D2 di
+//        scrittura e risposta (dimmer, tapparelle, termo, energia 0x10 = A1..AF). Comandi di area B3 0A 12 08/09/0A
+//        applicati alle tapparelle censite dell'area (CmdGruppoTapparelle). MsgValido: "check != 0" (era "^= 0").
+//        queueWrite: dopo una collisione gli interrupt vengono riabilitati prima di riprovare, cosi' l'attesa di
+//        bus libero vede davvero il telegramma in corso (prima: fino a 50 ritentativi alla cieca ogni 4 ms, con
+//        il ricevitore spento, che disturbavano i dialoghi dei termostati); massimo 10 tentativi.
 // 19.539 auto-ack
 // 19.538 filtro 8 per accettare checksum errati
 // 19.537 uart high speed
@@ -252,6 +258,7 @@ DEVICE devc[DEV_NR]; // 0xFF:empty  01:switch  03:dimmer  08:tapparella  09:tapp
 #define DEVT_ALARM		0x0E	// allarme
 #define DEVT_THERMO		0x0F	// zona di termoregolazione (sonda / termostato)
 #define DEVT_ENERGY		0x10	// misuratore di energia (WHO 18, indirizzo A0|N = WHERE 5N)
+#define DEVT_ZONE_MAX	99		// 19.544 - zone di termoregolazione OpenWebNet: 1..99 (i byte 01..63 sono condivisi con le luci)
 BYTE didx;
 BYTE dlen;
 // ===================================================================================
@@ -347,6 +354,7 @@ static BYTE         uart_echo = 3;
 static BYTE         uart_echo = 0;
 #endif
 static int errorCollision = 0;
+#define SCS_WRITE_RETRY 10	// 19.544 - tentativi massimi di scrittura dopo collisione (era 50, alla cieca)
 static int errorChecksum = 0;
 BYTE	uartTrace = 0;
 #pragma udata
@@ -592,6 +600,7 @@ void Write_config(BYTE mode);
 void Read_tapparelle(void);
 void Write_tapparelle(void);
 void CmdTotaleTapparelle(BYTE comando);
+void CmdGruppoTapparelle(BYTE area, BYTE comando);	// 19.544 - comandi di area B3
 
 static void InitializeBoard(void);
 void TickInit(void);
@@ -2430,12 +2439,17 @@ void InputMapping(void)
 						 dataByte.data[dataLength++] = 0xA3;
 						 queueWrite(dataLength);
 
-// test comandi globali 0xB1
-						if ((dataByte.data[1] == 0xB1)  // cmd globale
-						 && (dataByte.data[4] >= 0x08)  // cmd tapparelle
+// test comandi globali 0xB1 e di area 0xB3 (19.544)
+						if ((dataByte.data[4] >= 0x08)  // cmd tapparelle
 						 && (dataByte.data[4] <= 0x0A)
 						 && (opt.tapparelle_pct))       // ci sono tapparelle a percentuale 
+						{
+							if (dataByte.data[1] == 0xB1)  // cmd globale
 								CmdTotaleTapparelle(dataByte.data[4]);
+							else
+							if (dataByte.data[1] == 0xB3)  // cmd di area: secondo byte = area (B3 0A = area 10)
+								CmdGruppoTapparelle(dataByte.data[2], dataByte.data[4]);
+						}
 
 						  if (ee_avoid_answer == 0)
 								putcUSBwait('k');
@@ -3609,6 +3623,40 @@ void CmdTotaleTapparelle(BYTE comando)
 	} // switch  comando
 }
 
+// ===================================================================================
+// 19.544 - comando di area (B3 0A 12 08/09/0A): aggiorna solo le tapparelle censite nell'area A,
+//          cioe' quelle il cui indirizzo ha il nibble alto uguale ad A (B3 03 12 08 = *2*1*3##).
+//          area = 0xFF: tutte (equivale a CmdTotaleTapparelle). I comandi di gruppo B5 0N non si
+//          possono applicare: l'appartenenza ai gruppi non transita sul bus.
+void CmdGruppoTapparelle(BYTE area, BYTE comando)
+{
+	if ((comando < 0x08) || (comando > 0x0A))
+		return;
+	ixTapp = 0;
+	while (ixTapp < maxtapp)
+	{
+		if ((area == 0xFF) || ((devicetappa[ixTapp].device >> 4) == area))
+		{
+			if (comando == 0x0A)				// stop
+			{
+				tapparella[ixTapp].direction.half.LS = 0;
+				tapparella[ixTapp].timeout = 0;
+				tapparella[ixTapp].request = 0xFFFF;
+			}
+			else
+			if (tapparella[ixTapp].direction.half.LS == 0)	// alza / abbassa, se ferma
+			{
+				if (comando == 0x08)
+					tapparella[ixTapp].direction.Val = UP;	// pubblicazione immediata
+				else
+					tapparella[ixTapp].direction.Val = DOWN;
+				tapparella[ixTapp].timeout = 0;
+			}
+		}
+		ixTapp++;
+	}
+}
+
 // ******************************************************************************/
 // * output analyze and mapping                                                 */
 // ******************************************************************************/
@@ -3689,14 +3737,18 @@ BYTE tmpraw  = 0;	// 19.544 - byte tipo originale (prima della normalizzazione 3
 				  }
 
 				  // -----------------------------aggiorna tabella dispositivi-------------------------------
-				  // 19.544 - le regole seguenti sono quelle dei traduttori del firmware MyHOMEServer1
-				  //          (bt_luci, coso, bt_termo, bt_supervisione) verificate su 26.809 frame:
+				  // 19.544 - le regole seguenti sono quelle dei traduttori del firmware MyHOMEServer1 (bt_luci, coso,
+				  //          bt_termo, bt_supervisione; i firmware F454/F459/F461/F450 producono gli stessi frame),
+				  //          verificate su 26.809 frame registrati (tools/devtab_test):
 				  //          - valore x0 = ON, x1 = OFF (il nibble alto e' ignorato dal firmware)
-				  //          - valore x3 / x4 / AB / BB = dimmer su/giu'  (WHAT 30/31)
-				  //          - valore 1D..9D = livello dimmer 20..100%   (WHAT 2..10); 0D = semplice ON
+				  //          - valore x3 / x4 / AB / BB = dimmer su/giu' (WHAT 30/31) come COMANDO; come STATO (B8)
+				  //            02..07, 0C, 0F = stato sconosciuto (WHAT 255): non dicono nulla sul tipo di dispositivo
+				  //          - valore 1D..9D = livello dimmer 20..100% (WHAT 2..10); 0D = semplice ON
 				  //          - valore 08 / 09 / 0A = tapparella su / giu' / stop
 				  //          - B5 0N = comando di gruppo N, B3 0A = comando di area A: NON sono indirizzi di dispositivo
-				  //          - tipo 3N (N = indice sonda/attuatore) = termoregolazione, zona nel secondo byte (0..255)
+				  //          - tipo 3N = termoregolazione: zona nel secondo byte, N = indice sonda / attuatore
+				  //          - zone e luci condividono gli stessi byte (zona 40 = 0x28 = A2 PL8): la prima vista vince,
+				  //            dimmer e tapparelle (prove piu' specifiche) sovrascrivono comunque; @DFF azzera la tabella
 
 				  tmpraw = tmptype;
 				  if ((tmptype & 0xF0) == 0x30)	// 19.544 - termostati: 30..3F
@@ -3732,8 +3784,15 @@ BYTE tmpraw  = 0;	// 19.544 - byte tipo originale (prima della normalizzazione 3
 						if (opt.tapparelle_pct)
 							CmdTotaleTapparelle(tmpcmd);
 					}
-					// 19.544 - B3 0A (area) e B5 0N (gruppo): il secondo byte e' l'area/gruppo, non un dispositivo.
+					else
+					if (tmpdest == 0xB3)		// 19.544 - comando di area A (B3 0A): nessun dispositivo, ma le
+					{							//          tapparelle censite dell'area si muovono (B3 03 12 08 = *2*1*3##)
+						if (opt.tapparelle_pct)
+							CmdGruppoTapparelle(tmpfrom, tmpcmd);
+					}
+					// 19.544 - B3 0A (area) e B5 0N (gruppo): il secondo byte e' l'area / il gruppo, non un dispositivo.
 					//          Prima la 0xB5 veniva registrata come dispositivo "N" (es. B5 03 12 00 creava lo switch 03).
+					//          I gruppi non si possono applicare alle tapparelle: l'appartenenza non transita sul bus.
 
 					if ((didx > 0) && (didx < DEV_NR)) 
 					{
@@ -3822,6 +3881,12 @@ BYTE tmpraw  = 0;	// 19.544 - byte tipo originale (prima della normalizzazione 3
 // -------------------------------------------------------------------------------------------
 						default:
 							f = tmpcmd & 0x0F;
+							if ((tmpdest == 0xB8) &&				// come STATO 02..07, 0C, 0F = sconosciuto (WHAT 255):
+							   (((tmpcmd >= 0x02) && (tmpcmd <= 0x07))	// nessuna informazione sul tipo (03/04 NON sono dimmer qui)
+							||  (tmpcmd == 0x0C) || (tmpcmd == 0x0F)))
+							{
+							}
+							else
 							if ((f == 0x03) || (f == 0x04)			// x3 = piu'  x4 = meno  (dimmer, WHAT 30/31)
 							||  (tmpcmd == 0xAB) || (tmpcmd == 0xBB))	// AB = 30   BB = 31
 							{
@@ -3832,14 +3897,8 @@ BYTE tmpraw  = 0;	// 19.544 - byte tipo originale (prima della normalizzazione 3
 							{
 								devc[didx].devType = DEVT_DIMMER;
 							}
-							else
-							if ((tmpdest == 0xB8) &&				// come STATO 02..07, 0C, 0F = sconosciuto (WHAT 255);
-							   (((tmpcmd >= 0x02) && (tmpcmd <= 0x07))	// come COMANDO 06 = ON
-							||  (tmpcmd == 0x0C) || (tmpcmd == 0x0F)))
-							{
-							}
-							else									// x0 ON, x1 OFF, 0D ON, x6 temporizzazioni, xB lampeggi,
-							{										// 0E/EE (19), AD..FD (1000#11..16): e' una luce
+							else									// x0 ON, x1 OFF, 0D ON, 06 ON (comando), x6 temporizzazioni,
+							{										// xB lampeggi, 0E/EE (19), AD..FD (1000#11..16): e' una luce
 								if (devc[didx].all == 0xFF)
 									devc[didx].devType = DEVT_SWITCH;
 							}
@@ -3849,18 +3908,28 @@ BYTE tmpraw  = 0;	// 19.544 - byte tipo originale (prima della normalizzazione 3
 					} // 	if ((didx > 0) && (didx < DEV_NR))
 					break;				
 
-				  case 0x30:	// termostati  (tipo 30..3F: il nibble basso e' l'indice di sonda / attuatore)
-					// 19.544 - frame brevi della termoregolazione: B4/B5 temperatura misurata, 90/91/92 set point,
-					//          93 modo, 96/B7 stato attuatore, 99/A6/A9 richieste, 9D/9E/9F eventi.
-					//          La zona e' SEMPRE nel secondo byte (0..255; prima era accettata solo < 0x0F e solo con B4).
-					//          Nei frame 9D/9E/B7 e con tipo 31..3F il bit 7 della zona indica la forma "zona#attuatore".
-					didx = tmpfrom;
-					if ((tmpdest == 0x9D) || (tmpdest == 0x9E) || (tmpdest == 0xB7)
-					||  (tmpraw != 0x30))
-						didx &= 0x7F;
-					if ((didx > 0) && (didx < DEV_NR)) 
+				  case 0x30:	// termoregolazione (tipo 30..3F: N = indice di sonda / attuatore, zona nel secondo byte)
+					// 19.544 - B4/B5 temperatura misurata (dalla sonda di zona), 90/91/92 set point e 93 modo (scritti
+					//          alla zona), 96 comando attuatore, B7 stato attuatore, 9D/9E eventi, 9F/BF comandi: tutti
+					//          individuano una zona esistente. 99/A6/A9 sono richieste che la centrale manda anche a zone
+					//          inesistenti: ignorate (come il tipo 15 per le luci). Zone OpenWebNet: 1..99.
+					//          Con il bit 7 della zona e N != 0, nei frame 96 9D 9E B7 (e 99) la forma e' "zona#attuatore":
+					//          B7 80 31 .. = zona 0 attuatore 1. In B4 B5 90..93 il byte vale intero (B4 80 31 .. = zona 128,
+					//          inesistente in OpenWebNet: ignorata). Prima: solo B4 e solo zone < 15.
+					didx = 0;
+					if (((tmpdest >= 0x90) && (tmpdest <= 0x93))
+					||  (tmpdest == 0x96) || (tmpdest == 0x9D) || (tmpdest == 0x9E) || (tmpdest == 0x9F)
+					||  (tmpdest == 0xB4) || (tmpdest == 0xB5) || (tmpdest == 0xB7) || (tmpdest == 0xBF))
 					{
-						devc[didx].devType = DEVT_THERMO;
+						didx = tmpfrom;
+						if ((didx & 0x80) && ((tmpraw & 0x0F) != 0)
+						&& ((tmpdest == 0x96) || (tmpdest == 0x9D) || (tmpdest == 0x9E) || (tmpdest == 0xB7)))
+							didx &= 0x7F;			// forma zona#attuatore
+					}
+					if ((didx > 0) && (didx <= DEVT_ZONE_MAX))
+					{
+						if (devc[didx].all == 0xFF)	// la prima vista vince (zone e luci condividono i byte)
+							devc[didx].devType = DEVT_THERMO;
 					}
 				    break;
 
@@ -3885,15 +3954,18 @@ BYTE tmpraw  = 0;	// 19.544 - byte tipo originale (prima della normalizzazione 3
 
 				  } //  switch (scsMessageRx[rBufferIdxR][4]
 
-				  // 19.544 - frame estesi "dimensioni" (D1 aa ss kk DD ...): solo i D1 (punto) individuano un dispositivo;
-				  //          D2 e' generale / risposta senza indirizzo utile per la tabella, D5 e' area o gruppo.
-				  if (tmpext == 0xD1)
+				  // 19.544 - frame estesi "dimensioni" (D1/D2 aa ss kk DD b1 b2 b3): aa = indirizzo del punto (D1 comando /
+				  //          richiesta, D2 risposta del punto; D2 00 = generale e D5 = area / gruppo: nessun dispositivo).
+				  //          Solo le scritture (kk = x2) e le risposte (kk = x4) individuano un dispositivo esistente,
+				  //          non le richieste (kk = x3), che il gateway manda anche a indirizzi vuoti.
+				  if (((tmpext == 0xD1) || (tmpext == 0xD2))
+				  &&  (((tmpcmd & 0x0F) == 0x02) || ((tmpcmd & 0x0F) == 0x04)))
 				  {
 					  didx = tmpdest;
 					  switch (tmpsys & 0x0F)
 					  {
-					  case 0x01:	// luci / tapparelle  (D1 aa 01 42|43|44 DD b1 b2 b3)
-						  if ((didx > 0) && (didx < DEV_NR))
+					  case 0x01:	// luci / tapparelle  (nibble alto di ss = interfaccia bus, ignorato come per i frame EC)
+						  if ((didx > 0) && (didx < 0xB0))
 						  {
 							  if ((tmpdim == 0x0D) && (tmpb1 == 0x0D))		// dimensione 1 (livello + velocita'): e' un dimmer
 							  {
@@ -3902,18 +3974,27 @@ BYTE tmpraw  = 0;	// 19.544 - byte tipo originale (prima della normalizzazione 3
 							  else
 							  if (tmpdim == 0x09)							// dimensioni 10/11/12 di coso: e' una tapparella
 							  {
-								  if (devc[didx].devType != 9) devc[didx].devType = DEVT_COVER;
+								  if (devc[didx].devType != DEVT_COVER_PCT) devc[didx].devType = DEVT_COVER;
 							  }
 						  }
 						  break;
-					  case 0x02:	// energia  (D1 aa 02 32|33 ...  aa = A0|N  <->  WHERE 5N)
-						  if ((didx > 0) && (didx < DEV_NR))
-							  devc[didx].devType = DEVT_ENERGY;
+					  case 0x02:	// energia: misuratori A1..AF <-> WHERE 51..515 (A0|N = 5N); 8N e 0N sono attuatori / stop&go
+						  if (((didx & 0xF0) == 0xA0) && ((didx & 0x0F) != 0))
+						  {
+							  if (devc[didx].all == 0xFF)
+								  devc[didx].devType = DEVT_ENERGY;
+						  }
 						  break;
-					  case 0x03:	// termoregolazione  (D1 zz 03 02|03 ...;  D1 (80|zz) 13 02 ... = attuatore)
-						  if (tmpsys != 0x03) didx &= 0x7F;
-						  if ((didx > 0) && (didx < DEV_NR))
-							  devc[didx].devType = DEVT_THERMO;
+					  case 0x03:	// termoregolazione: aa = zona, nibble alto di ss = sonda / attuatore N
+						  if ((tmpdim == 0xC1) || (tmpdim == 0xC2))		// dimensioni C1/C2 = forme "#0#N" / "#N" della
+							  break;										// centrale (aa = sonda della centrale, non zona)
+						  if ((didx & 0x80) && ((tmpsys & 0xF0) != 0))	// bit 7 con N != 0: forma zona#attuatore
+							  didx &= 0x7F;								// (D1 A8 13 02 .. = zona 40 attuatore 1)
+						  if ((didx > 0) && (didx <= DEVT_ZONE_MAX))
+						  {
+							  if (devc[didx].all == 0xFF)
+								  devc[didx].devType = DEVT_THERMO;
+						  }
 						  break;
 					  default:
 						  break;
@@ -4711,15 +4792,18 @@ BYTE retry;
 				DisplayScsTx(msgLen);
 
 	// attende che termini eventuale telegramma in arrivo - anti collisione PREVENTIVO
-		clear = 4;
+	// 19.544 - dopo una collisione si aspetta di piu' (8, 12, 16 ... ms di bus libero) per lasciare passare la
+	//          ripetizione del telegramma dell'altro dispositivo, e si guarda anche il livello del bus (INPUT_SCS):
+	//          il ricevitore (R_READING) e' di nuovo attivo perche' gli interrupt sono riabilitati dopo ogni tentativo.
+		clear = 4 + (retry << 2);
 		n = 0;
 		while ((clear) && (n < 300))
 		{
 			DelayMs(1);
-			if (optionR.R_READING)// || (INPUT_SCS == 1)) 	// lettura in corso !
+			if ((optionR.R_READING) || (INPUT_SCS == 1)) 	// lettura in corso o bus dominante !
 			{
 				ClrWdt();
-				clear = 4;
+				clear = 4 + (retry << 2);
 				n++;
 			}
 			else
@@ -4735,20 +4819,25 @@ BYTE retry;
 		n = scsSendWait(msgLen);
 		retry++;
 		if (optionW.W_ERROR)  errorCollision++;
-	} while ((optionW.W_ERROR == 1) && (retry < 50));
+
+	// 19.544 - interrupt riabilitati subito, anche se si dovra' riprovare: prima restavano spenti per tutta la
+	//          sequenza dei tentativi, R_READING non veniva piu' aggiornato e ogni nuovo tentativo partiva dopo
+	//          soli 4 ms in mezzo al telegramma che aveva causato la collisione (fino a 50 volte di seguito,
+	//          un impulso spurio per volta): i termostati ne uscivano con il dialogo con l'attuatore disturbato.
+		PIR4bits.CMP1IF  = 0;    // clear interrupt
+		PIR2bits.TMR3IF  = 0;    // clear INTERRUPT FLAG
+		INTCONbits.TMR0IF = 0;   // clear INTERRUPT FLAG
+		INTCONbits.GIEH     = 1; // high priority interrupt enabled
+		INTCONbits.GIEL     = 1; // low  priority interrupt enabled
+		optionR.Val = 0;
+	} while ((optionW.W_ERROR == 1) && (retry < SCS_WRITE_RETRY));
 
 	rBufferIdxP = 0xFF;		// <--- al prossimo giro non controlla messaggi doppi
 
-	PIR4bits.CMP1IF  = 0;    // clear interrupt
-    PIR2bits.TMR3IF  = 0;    // clear INTERRUPT FLAG
-    INTCONbits.TMR0IF = 0;   // clear INTERRUPT FLAG
-	INTCONbits.GIEH     = 1; // high priority interrupt enabled
-	INTCONbits.GIEL     = 1; // low  priority interrupt enabled
 //	PIE4bits.CMP1IE  = 1;    // open interrupt
 //	INTCONbits.TMR0IE = 1;   // open INTERRUPT     
 
 //  optionW.W_COLLISION = 0; // controllo collisioni ripristinato
-	optionR.Val = 0;
     DelayMs(52);   // stream da 7 byte = 10+4=14mS  x 3stream = 42mS + ack = 50mS
 }
 // ===================================================================================
