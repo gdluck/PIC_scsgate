@@ -203,10 +203,24 @@ The board tells which variant it runs: `@q` answers `SCS 80.543` for a `_RASPBER
 ESP8285, `66.` = ESP8266, `70.` = Raspberry 7; a trailing `B` = `_BOOTMODE`). The USB boards with an MCP2200
 bridge answer `80.` and build from the RASPY_8 project.
 
-Both tools exist for Windows only (MPLAB IDE 8.92 and MPLAB C18 v3.47 lite, from Microchip's archives).
-`tools/build_mplab8.bat` runs the same command lines MPLAB 8 generates for the project, from the
-repository root (`wine cmd /c tools\build_mplab8.bat` under Wine); it was written from the `.mcp` settings
-and the MPLAB 8 build log conventions, so check `OBJ\*.err` on the first run.
+Both tools exist for Windows only (MPLAB IDE 8.92 and MPLAB C18 v3.47 lite, from Microchip's archives;
+the `.mcp` points at C18 v3.46, with every optimisation switched off, which the free lite edition
+reproduces). `tools/build_mplab8.bat` runs the same command lines MPLAB 8 generates for the project
+(`wine cmd /c tools\build_mplab8.bat` under Wine) and `tools/build_wine.sh` runs them through Wine
+directly, both from the repository root; the objects go to `OBJ/`, the hex to `BIN/`.
+
+What worked on macOS, without a system install: a Wine build with 32-bit support (Wine 10 or later;
+the Gcenx "Wine stable" build unpacked into a folder), the `MPASM Suite` taken out of the MPLAB 8.92
+installer's MSI (`msiexec /a`, no IDE needed) and C18 v3.47 lite from the Wayback Machine, since
+microchip.com refuses the direct link. Its BitRock installer in unattended mode installs everything
+except the compiler itself (`mcc18.exe`, `mcc18-traditional.exe`, `mcc18-extended.exe` belong to a
+component only the GUI selects): take them out of the installer payload with `bitrock-unpacker` and
+drop them into `bin`. Then `WINE=... WINEPREFIX=... tools/build_wine.sh`.
+
+The toolchain was proven before building anything new: the untouched 543 source rebuilt this way is
+byte-for-byte identical to `BIN/espscsgate_RASPY_8.hex` (`tools/compare_hex.py`, 0 differing bytes in
+every region). The 544 build is 30320 bytes at `0000`-`7673` (474 pages), with the bootloader region
+and config words identical to 543; it answers `@q` with `SCS 80.544`.
 
 ## Flashing over USB
 
@@ -219,7 +233,7 @@ python3 tools/scsgate_flash.py --port /dev/cu.usbmodemXXXX --hex BIN/espscsgate_
 ```
 
 Every message, in both directions, is `LL 10 07 data…` with `LL` = 2 + number of data bytes (`10` = host
-address, `07` = firmware command): `00` query → `04 10 07 00 VV` (the bootloader also sends this on entry);
+address, `07` = firmware command): `00` query → `04 10 07 00 xx` (the bootloader also sends this on entry);
 `01 AL AH 40` opens a 64-byte page at flash address `AHAL`, followed by the 64 bytes as eight messages of
 eight data bytes; `02 CL CH` closes it with the 16-bit sum of the bytes and writes → `08 10 07 02 RR CL CH cl ch`
 with `RR` `00` written, `01` protected (`F000`-`FFFF`), `FE`/`FF` checksum mismatch; `03 CL CH` closes without
@@ -229,6 +243,9 @@ address 0), pads pages with `FF`, writes page 0 last, waits for every reply and 
 `--write` runs the complete dry run first (every page echoed back and compared) and only then writes.
 
 A write that stops half-way leaves the board without a working program, and the bootloader is only
-reachable from that program: keep the cable still, and keep a PICkit at hand for that case. The
-bootloader burned in the boards seen so far reports version `A1`, not the `1B` of the source here; its
-protocol is the one above.
+reachable from that program: keep the cable still, and keep a PICkit at hand for that case. The second
+byte of the query answer is not the version: `ReproQuery` stores `REPRO_VERSION` one byte beyond the two
+it sends, so it only shows as the fourth data byte of the first `03` reply (`08 10 07 03 xx xx 1B xx xx`),
+and the boards seen so far carry `1B`, the version of the source here. The 544 image was put on a board
+this way (dry run, then 474 pages written and acknowledged, board reset, bootloader entered again from
+the new firmware).

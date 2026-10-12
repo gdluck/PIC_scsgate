@@ -2,7 +2,9 @@
 """Flash a PIC_scsgate board (PIC18F26K80 + MCP2200) through its own serial bootloader.
 
 Wire protocol (both directions):  LL 10 07 <data...>   with LL = 2 + len(data)
-  0x00 query -> 04 10 07 00 VV; 0x01 AL AH 40 new block, then 8 x (0A 10 07 b0..b7);
+  0x00 query -> 04 10 07 00 xx (xx is NOT the version: the bootloader stores REPRO_VERSION one byte
+  beyond what it sends; it shows up as the 4th data byte of the first 0x03 reply, 08 10 07 03 xx xx VV xx xx);
+  0x01 AL AH 40 new block, then 8 x (0A 10 07 b0..b7);
   0x02 CL CH end+write -> 08 10 07 02 RR CL CH cl ch (RR 00 ok, 01 protected, FE/FF checksum);
   0x03 CL CH end without write (no checksum check, verify with 0x55); 0x55 echo -> 40 + 64 bytes;
   0x80 reset.  On entry ('@' 0x11) the bootloader sends the query reply by itself.
@@ -71,9 +73,9 @@ class Bootloader:
         return body[3:]
     def enter(self):
         self.sp.reset_input_buffer(); self.sp.write(ENTER_BOOT)
-        return self._reply_data(0x00)[0]
+        return self._reply_data(0x00)
     def query(self):
-        self._send([0x00]); return self._reply_data(0x00)[0]
+        self._send([0x00]); return self._reply_data(0x00)
     def send_page(self, addr, data, write):
         assert len(data) == PAGE and addr & (PAGE - 1) == 0 and addr < APP_END
         self._send([0x01, addr & 0xFF, addr >> 8, PAGE])
@@ -101,6 +103,8 @@ def run_pass(bl, pages, write):
             if rr in (0xFE, 0xFF): raise IOError('page %04X: checksum mismatch sent %02X%02X got %02X%02X' % (addr, r[2], r[1], r[4], r[3]))
             if rr != 0x00: raise IOError('page %04X: write status %02X' % (addr, rr))
         else:
+            if n == 1 and len(r) >= 4:  # REPRO_VERSION sits one byte beyond the query reply, visible here until a 0x02
+                print('bootloader version 0x%02X (end-of-block reply %s)' % (r[3], r.hex(' ')))
             if bl.echo() != data: raise IOError('page %04X: echo differs from the data sent' % addr)
         print('\r%s page %d/%d  @%04X' % (label, n, len(pages), addr), end='', flush=True)
     print('\r%s: %d pages OK            ' % (label, len(pages)))
@@ -117,8 +121,8 @@ def main():
     if 0 not in mem or 1 not in mem: sys.exit('refusing: the image has no reset vector at 0x0000')
     bl = Bootloader(a.port, a.baud, verbose=a.verbose)
     try:
-        ver = bl.enter()
-        print('bootloader entered, version 0x%02X (query again: 0x%02X)' % (ver, bl.query()))
+        r = bl.enter()
+        print('bootloader entered (reply %s, query again %s)' % (r.hex(' '), bl.query().hex(' ')))
         run_pass(bl, pages, write=False)
         if a.write:
             print('dry run passed; starting the real write (do not unplug!)')
