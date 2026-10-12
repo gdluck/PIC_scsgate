@@ -195,6 +195,8 @@ make -C tools/devtab_test test              # PIC classifier vs corpus: 19549/19
 
 ## Building the PIC image
 
+State of the work, the rules followed and how to resume it: `docs/WORKLOG.md`.
+
 MPLAB 8 with the Microchip C18 compiler, project `espscsgate_RASPY_8.mcp`. Define one of `_ESP8266`,
 `_ESP8285`, `_RASPBERRY_8` (and `_BOOTMODE` for the bootloader layout) in the project settings. The
 changes in this fork are plain C89 in `ESPSCSGATE.C` only (version 544); the bus driver and the build are untouched.
