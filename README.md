@@ -29,6 +29,8 @@ writes and thermostats*).
 | `tools/scs_own/` | SCS ⇄ OpenWebNet translator recovered from the MyHOMEServer1 firmware (C99 + Python), with the 26,809-frame corpus and the 111,820 recorded firmware answers it is validated against |
 | `tools/scsgate_own.py` | reads the gateway's serial output and prints the OpenWebNet messages for each frame |
 | `tools/devtab_test/` | host build of the PIC's device-table classifier, replayed against the firmware corpus |
+| `tools/scsgate_flash.py` | writes a hex image into the board through its serial bootloader (see *Flashing over USB*) |
+| `tools/build_mplab8.bat` | command-line build with MPLAB 8 + C18, mirroring the `.mcp` project |
 
 ## SCS frames, as the firmware sees them
 
@@ -196,3 +198,37 @@ make -C tools/devtab_test test              # PIC classifier vs corpus: 19549/19
 MPLAB 8 with the Microchip C18 compiler, project `espscsgate_RASPY_8.mcp`. Define one of `_ESP8266`,
 `_ESP8285`, `_RASPBERRY_8` (and `_BOOTMODE` for the bootloader layout) in the project settings. The
 changes in this fork are plain C89 in `ESPSCSGATE.C` only (version 544); the bus driver and the build are untouched.
+
+The board tells which variant it runs: `@q` answers `SCS 80.543` for a `_RASPBERRY_8` build (`85.` =
+ESP8285, `66.` = ESP8266, `70.` = Raspberry 7; a trailing `B` = `_BOOTMODE`). The USB boards with an MCP2200
+bridge answer `80.` and build from the RASPY_8 project.
+
+Both tools exist for Windows only (MPLAB IDE 8.92 and MPLAB C18 v3.47 lite, from Microchip's archives).
+`tools/build_mplab8.bat` runs the same command lines MPLAB 8 generates for the project, from the
+repository root (`wine cmd /c tools\build_mplab8.bat` under Wine); it was written from the `.mcp` settings
+and the MPLAB 8 build log conventions, so check `OBJ\*.err` on the first run.
+
+## Flashing over USB
+
+The image carries its own bootloader at `F000`-`FFFF` (`LIB/CANREPRO_232_EVO.ASM`), which the running
+firmware enters on the two bytes `@` `0x11` at the current UART speed. `tools/scsgate_flash.py` drives it:
+
+```sh
+python3 tools/scsgate_flash.py --port /dev/cu.usbmodemXXXX --hex BIN/espscsgate_RASPY_8.hex          # dry run
+python3 tools/scsgate_flash.py --port /dev/cu.usbmodemXXXX --hex BIN/espscsgate_RASPY_8.hex --write  # dry run, then write
+```
+
+Every message, in both directions, is `LL 10 07 data…` with `LL` = 2 + number of data bytes (`10` = host
+address, `07` = firmware command): `00` query → `04 10 07 00 VV` (the bootloader also sends this on entry);
+`01 AL AH 40` opens a 64-byte page at flash address `AHAL`, followed by the 64 bytes as eight messages of
+eight data bytes; `02 CL CH` closes it with the 16-bit sum of the bytes and writes → `08 10 07 02 RR CL CH cl ch`
+with `RR` `00` written, `01` protected (`F000`-`FFFF`), `FE`/`FF` checksum mismatch; `03 CL CH` closes without
+writing (and without checking); `55` echoes the page buffer (`40` + 64 bytes); `80` resets the board. The
+tool sends only `0000`-`EFFF` (the config words at `300000` and the EEPROM at `F00000` would wrap onto
+address 0), pads pages with `FF`, writes page 0 last, waits for every reply and stops at the first error.
+`--write` runs the complete dry run first (every page echoed back and compared) and only then writes.
+
+A write that stops half-way leaves the board without a working program, and the bootloader is only
+reachable from that program: keep the cable still, and keep a PICkit at hand for that case. The
+bootloader burned in the boards seen so far reports version `A1`, not the `1B` of the source here; its
+protocol is the one above.

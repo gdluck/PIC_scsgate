@@ -7,3 +7,6 @@
   firmware answers (`corpus/`) it is validated against.
 * `devtab_test/` – compiles the device-table classifier and the area cover command out of
   `../ESPSCSGATE.C` and replays the corpus through them (`make test`).
+* `scsgate_flash.py` – flashes a hex image through the board's own serial bootloader (dry run by default,
+  `--write` for the real pass).
+* `build_mplab8.bat` – builds the RASPY_8 image with the MPLAB 8 command-line tools (Windows or Wine).
